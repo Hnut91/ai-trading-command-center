@@ -7,9 +7,15 @@ from datetime import datetime
 import pandas as pd
 import streamlit as st
 
+from modules.backtesting import moving_average_crossover_backtest
+from modules.charts import backtest_equity_chart, price_volume_chart
 from modules.market_data import DEFAULT_IDEAS, get_daily_ideas, get_price_history, get_ticker_snapshot
 from modules.memo_agent import generate_investment_memo
-from modules.scoring import score_ideas, score_ticker
+from modules.paper_trading import alpaca_ready, create_simulated_order
+from modules.scoring import score_ideas, score_ticker, simple_score
+
+
+SCANNER_UNIVERSE = ["AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOGL", "TSLA"]
 
 
 st.set_page_config(
@@ -25,17 +31,31 @@ def main() -> None:
     st.title("AI Long/Short Command Center")
     st.caption("AI-native hedge fund research dashboard for idea generation, memo writing, and paper tracking.")
 
-    tabs = st.tabs(["Daily Ideas", "Ticker Research", "Paper Portfolio", "Watchlist", "Agent Log"])
+    tabs = st.tabs(
+        [
+            "Daily Ideas",
+            "Daily Scanner",
+            "Ticker Research",
+            "Backtesting",
+            "Paper Trading",
+            "Watchlist",
+            "Agent Log",
+        ]
+    )
 
     with tabs[0]:
         render_daily_ideas()
     with tabs[1]:
-        render_ticker_research()
+        render_daily_scanner()
     with tabs[2]:
-        render_portfolio()
+        render_ticker_research()
     with tabs[3]:
-        render_watchlist()
+        render_backtesting()
     with tabs[4]:
+        render_paper_trading()
+    with tabs[5]:
+        render_watchlist()
+    with tabs[6]:
         render_agent_log()
 
 
@@ -90,7 +110,13 @@ def render_ticker_research() -> None:
             snapshot = get_ticker_snapshot(ticker)
             history = get_price_history(ticker, period=period)
             score = score_ticker(snapshot.as_dict(), history)
-            memo = generate_investment_memo(ticker, snapshot.as_dict(), score, notes)
+            memo = generate_investment_memo(
+                ticker,
+                snapshot.as_dict(),
+                score,
+                notes,
+                api_key=_secret_value("OPENAI_API_KEY"),
+            )
 
             st.session_state["research"] = {
                 "ticker": ticker,
@@ -115,7 +141,7 @@ def render_ticker_research() -> None:
             metric_cols[3].metric("Forward P/E", _number(snapshot.get("forward_pe")))
 
             if isinstance(history, pd.DataFrame) and not history.empty:
-                st.line_chart(history.set_index("Date")["Close"])
+                st.plotly_chart(price_volume_chart(history, research["ticker"]), use_container_width=True)
 
         st.markdown("### AI Investment Memo")
         st.markdown(research["memo"])
@@ -129,25 +155,142 @@ def render_ticker_research() -> None:
                 _add_position(research["ticker"], score["stance"], snapshot.get("price"))
 
 
-def render_portfolio() -> None:
-    st.subheader("Paper Portfolio")
+def render_daily_scanner() -> None:
+    st.subheader("Daily Scanner")
+    st.caption("Ranks the core mega-cap universe with simple_score using recent trend and volatility.")
+
+    if st.button("Run Scanner", type="primary"):
+        rows = []
+        with st.spinner("Scanning liquid mega-cap names..."):
+            for ticker in SCANNER_UNIVERSE:
+                history = get_price_history(ticker, period="6mo")
+                snapshot = get_ticker_snapshot(ticker)
+                rows.append(
+                    {
+                        "ticker": ticker,
+                        "name": snapshot.name,
+                        "price": snapshot.price,
+                        "simple_score": simple_score(history),
+                        "one_month_return": _window_return(history, 21),
+                        "three_month_return": _window_return(history, 63),
+                    }
+                )
+
+        scanner = pd.DataFrame(rows).sort_values("simple_score", ascending=False)
+        st.session_state["scanner"] = scanner
+        _log("Ran daily scanner")
+
+    scanner = st.session_state.get("scanner")
+    if isinstance(scanner, pd.DataFrame) and not scanner.empty:
+        st.dataframe(scanner, use_container_width=True, hide_index=True)
+    else:
+        st.info("Run the scanner to rank AAPL, MSFT, NVDA, META, AMZN, GOOGL, and TSLA.")
+
+
+def render_backtesting() -> None:
+    st.subheader("Backtesting")
+    st.caption("Simple long/cash moving-average crossover backtest using yfinance history.")
+
+    cols = st.columns([1, 1, 1, 1])
+    ticker = cols[0].text_input("Backtest ticker", value="MSFT").upper()
+    period = cols[1].selectbox("Backtest period", ["1y", "2y", "5y", "10y"], index=2)
+    short_window = cols[2].number_input("Short MA", min_value=5, max_value=100, value=20, step=5)
+    long_window = cols[3].number_input("Long MA", min_value=20, max_value=250, value=50, step=10)
+    starting_cash = st.number_input("Starting cash", min_value=1_000.0, value=100_000.0, step=10_000.0)
+
+    if st.button("Run Backtest", type="primary"):
+        try:
+            history = get_price_history(ticker, period=period)
+            results, metrics = moving_average_crossover_backtest(
+                history,
+                short_window=int(short_window),
+                long_window=int(long_window),
+                starting_cash=float(starting_cash),
+            )
+            st.session_state["backtest"] = {"ticker": ticker, "results": results, "metrics": metrics}
+            _log(f"Ran moving-average backtest for {ticker}")
+        except ValueError as exc:
+            st.error(str(exc))
+
+    backtest = st.session_state.get("backtest")
+    if not backtest:
+        st.info("Run a backtest to compare the crossover strategy with buy and hold.")
+        return
+
+    metrics = backtest["metrics"]
+    metric_cols = st.columns(5)
+    metric_cols[0].metric("Ending Equity", _money(metrics["ending_equity"]))
+    metric_cols[1].metric("Strategy Return", _percent(metrics["total_return"]))
+    metric_cols[2].metric("Buy & Hold", _percent(metrics["buy_hold_return"]))
+    metric_cols[3].metric("Sharpe", _number(metrics["sharpe"]))
+    metric_cols[4].metric("Max Drawdown", _percent(metrics["max_drawdown"]))
+
+    results = backtest["results"]
+    if isinstance(results, pd.DataFrame) and not results.empty:
+        st.plotly_chart(backtest_equity_chart(results, backtest["ticker"]), use_container_width=True)
+        st.dataframe(results.tail(20), use_container_width=True, hide_index=True)
+    else:
+        st.warning("Not enough price history for that backtest configuration.")
+
+
+def render_paper_trading() -> None:
+    st.subheader("Paper Trading")
+    st.caption("Simulated order ticket prepared for Alpaca paper trading. No real orders are placed.")
+
+    alpaca_configured = alpaca_ready(
+        _secret_value("ALPACA_API_KEY"),
+        _secret_value("ALPACA_SECRET_KEY"),
+        _secret_value("ALPACA_BASE_URL") or "https://paper-api.alpaca.markets",
+    )
+    st.info(
+        "Alpaca paper credentials detected in Streamlit secrets."
+        if alpaca_configured
+        else "Add ALPACA_API_KEY, ALPACA_SECRET_KEY, and ALPACA_BASE_URL to Streamlit secrets when ready."
+    )
 
     with st.form("position_form", clear_on_submit=True):
-        cols = st.columns(5)
+        cols = st.columns(6)
         ticker = cols[0].text_input("Ticker")
-        side = cols[1].selectbox("Side", ["Long", "Short"])
+        side = cols[1].selectbox("Side", ["buy", "sell"])
         quantity = cols[2].number_input("Quantity", min_value=0.0, step=1.0)
-        entry_price = cols[3].number_input("Entry Price", min_value=0.0, step=1.0)
-        submitted = cols[4].form_submit_button("Add")
+        order_type = cols[3].selectbox("Order Type", ["market", "limit"])
+        limit_price = cols[4].number_input("Limit Price", min_value=0.0, step=1.0)
+        submitted = cols[5].form_submit_button("Simulate")
 
     if submitted and ticker:
-        _add_position(ticker.upper(), side, entry_price, quantity)
+        order = create_simulated_order(
+            ticker=ticker,
+            side=side,
+            quantity=quantity,
+            order_type=order_type,
+            limit_price=limit_price if order_type == "limit" else None,
+        )
+        st.session_state["paper_orders"].append(order.as_dict())
+        _add_position(ticker.upper(), "Long" if side == "buy" else "Short", limit_price, quantity)
+        _log(f"Simulated {side} order for {ticker.upper()}")
 
+    portfolio = pd.DataFrame(st.session_state["portfolio"])
+    orders = pd.DataFrame(st.session_state["paper_orders"])
+
+    st.markdown("### Paper Positions")
+    if portfolio.empty:
+        st.info("No paper positions yet.")
+    else:
+        st.dataframe(portfolio, use_container_width=True, hide_index=True)
+
+    st.markdown("### Simulated Orders")
+    if orders.empty:
+        st.info("No simulated orders yet.")
+    else:
+        st.dataframe(orders, use_container_width=True, hide_index=True)
+
+
+def render_portfolio() -> None:
+    st.subheader("Paper Portfolio")
     portfolio = pd.DataFrame(st.session_state["portfolio"])
     if portfolio.empty:
         st.info("No paper positions yet.")
         return
-
     st.dataframe(portfolio, use_container_width=True, hide_index=True)
 
 
@@ -184,6 +327,7 @@ def render_agent_log() -> None:
 
 def _init_state() -> None:
     st.session_state.setdefault("portfolio", [])
+    st.session_state.setdefault("paper_orders", [])
     st.session_state.setdefault("watchlist", [])
     st.session_state.setdefault("agent_log", [])
 
@@ -224,6 +368,26 @@ def _money(value: object) -> str:
 
 def _number(value: object) -> str:
     return f"{value:,.1f}" if isinstance(value, (int, float)) else "n/a"
+
+
+def _percent(value: object) -> str:
+    return f"{value:.1%}" if isinstance(value, (int, float)) else "n/a"
+
+
+def _window_return(history: pd.DataFrame, window: int) -> float | None:
+    if history.empty or "Close" not in history:
+        return None
+    closes = history["Close"].dropna().tail(window)
+    if len(closes) < 2 or closes.iloc[0] == 0:
+        return None
+    return float((closes.iloc[-1] / closes.iloc[0]) - 1)
+
+
+def _secret_value(name: str) -> str | None:
+    try:
+        return st.secrets.get(name)
+    except Exception:
+        return None
 
 
 if __name__ == "__main__":

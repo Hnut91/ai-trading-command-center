@@ -27,10 +27,11 @@ def generate_investment_memo(
     score: dict[str, Any],
     notes: str = "",
     model: str = "gpt-4o-mini",
+    api_key: str | None = None,
 ) -> str:
     """Generate an investment memo with the OpenAI API."""
 
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = api_key or os.getenv("OPENAI_API_KEY")
     if not api_key:
         return _offline_memo(ticker, snapshot, score, notes)
 

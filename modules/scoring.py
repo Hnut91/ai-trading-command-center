@@ -27,6 +27,29 @@ def score_ticker(snapshot: dict[str, object], history: pd.DataFrame) -> dict[str
     }
 
 
+def simple_score(history: pd.DataFrame) -> float:
+    """Rank liquid names using price trend and volatility only."""
+
+    if history.empty or "Close" not in history:
+        return 50.0
+
+    closes = history["Close"].dropna()
+    if len(closes) < 30:
+        return 50.0
+
+    one_month = closes.tail(min(21, len(closes)))
+    three_month = closes.tail(min(63, len(closes)))
+    one_month_return = _series_return(one_month)
+    three_month_return = _series_return(three_month)
+    volatility = closes.pct_change().dropna().tail(63).std()
+
+    score = 50 + (one_month_return * 120) + (three_month_return * 80)
+    if pd.notna(volatility):
+        score -= min(float(volatility) * 350, 20)
+
+    return round(_bounded(score, 0, 100), 1)
+
+
 def score_ideas(ideas: pd.DataFrame) -> pd.DataFrame:
     """Add a quick score and suggested stance to a daily ideas DataFrame."""
 
@@ -114,6 +137,12 @@ def _summary_for_score(stance: str, total: float) -> str:
 
 def _bounded(value: float, lower: float, upper: float) -> float:
     return max(lower, min(upper, float(value)))
+
+
+def _series_return(series: pd.Series) -> float:
+    if len(series) < 2 or series.iloc[0] == 0:
+        return 0.0
+    return float((series.iloc[-1] / series.iloc[0]) - 1)
 
 
 def _as_float(value: object) -> float:
