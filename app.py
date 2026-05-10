@@ -9,11 +9,18 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from modules.backtesting import moving_average_crossover_backtest
+from modules.alpaca_client import (
+    get_connection_status,
+    get_paper_account,
+    get_paper_orders,
+    get_paper_positions,
+    submit_paper_order,
+)
 from modules.charts import backtest_equity_chart, price_volume_chart
 from modules.market_data import DEFAULT_IDEAS, get_daily_ideas, get_price_history, get_ticker_snapshot
 from modules.memo_agent import generate_investment_memo
-from modules.paper_trading import alpaca_ready, create_simulated_order
 from modules.scoring import score_ideas, score_ticker, simple_score
+from modules.trade_journal import append_trade_journal, read_trade_journal
 
 
 SCANNER_UNIVERSE = ["AAPL", "MSFT", "NVDA", "META", "AMZN", "GOOGL", "TSLA"]
@@ -253,65 +260,105 @@ def render_backtesting() -> None:
 
 def render_paper_trading() -> None:
     st.subheader("Paper Trading")
-    st.caption("Paper trading only. No live orders.")
+    st.caption("Paper trading only. No live orders. This is not investment advice.")
 
-    alpaca_configured = alpaca_ready(
-        _secret_value("ALPACA_API_KEY"),
-        _secret_value("ALPACA_SECRET_KEY"),
-        _secret_value("ALPACA_BASE_URL") or "https://paper-api.alpaca.markets",
-    )
-    st.info(
-        "Alpaca paper credentials detected in Streamlit secrets."
-        if alpaca_configured
-        else "Add ALPACA_API_KEY, ALPACA_SECRET_KEY, and ALPACA_BASE_URL to Streamlit secrets when ready."
-    )
+    status = get_connection_status()
+    if status["ok"]:
+        st.success(status["message"])
+    else:
+        st.warning(f"{status['error']} Add Alpaca paper credentials in Streamlit secrets to enable API calls.")
 
-    action_cols = st.columns(3)
-    if action_cols[0].button("Check Alpaca Connection"):
-        if alpaca_configured:
-            st.success("Alpaca paper credentials are configured. Live API calls are intentionally disabled.")
+    if st.button("Check Alpaca Connection"):
+        account_result = get_paper_account()
+        if account_result["ok"]:
+            st.success("Connected to Alpaca paper trading.")
         else:
-            st.warning("Missing Alpaca secrets. Add them in Streamlit Community Cloud secrets when ready.")
-    if action_cols[1].button("View Paper Account"):
-        st.info("Placeholder only. This will show paper account balances after Alpaca API calls are enabled.")
-    if action_cols[2].button("Submit Test Paper Order"):
-        st.info("Placeholder only. No order was sent to Alpaca.")
+            st.error(account_result["error"])
 
-    with st.form("position_form", clear_on_submit=True):
-        cols = st.columns(6)
-        ticker = cols[0].text_input("Ticker")
-        side = cols[1].selectbox("Side", ["buy", "sell"])
-        quantity = cols[2].number_input("Quantity", min_value=0.0, step=1.0)
-        order_type = cols[3].selectbox("Order Type", ["market", "limit"])
-        limit_price = cols[4].number_input("Limit Price", min_value=0.0, step=1.0)
-        submitted = cols[5].form_submit_button("Simulate")
+    account_result = get_paper_account()
+    if account_result["ok"]:
+        account = account_result["data"]
+        account_cols = st.columns(3)
+        account_cols[0].metric("Paper Account Equity", _money_text(account.get("equity")))
+        account_cols[1].metric("Cash", _money_text(account.get("cash")))
+        account_cols[2].metric("Buying Power", _money_text(account.get("buying_power")))
+    else:
+        st.info("Paper account metrics will appear here after Alpaca paper secrets are configured.")
 
-    if submitted and ticker:
-        order = create_simulated_order(
-            ticker=ticker,
-            side=side,
-            quantity=quantity,
-            order_type=order_type,
-            limit_price=limit_price if order_type == "limit" else None,
+    st.markdown("### Current Paper Positions")
+    positions_result = get_paper_positions()
+    if positions_result["ok"]:
+        positions = _select_columns(
+            positions_result["data"],
+            ["symbol", "qty", "side", "market_value", "avg_entry_price", "unrealized_pl"],
         )
-        st.session_state["paper_orders"].append(order.as_dict())
-        _add_position(ticker.upper(), "Long" if side == "buy" else "Short", limit_price, quantity)
-        _log(f"Simulated {side} order for {ticker.upper()}")
-
-    portfolio = pd.DataFrame(st.session_state["portfolio"])
-    orders = pd.DataFrame(st.session_state["paper_orders"])
-
-    st.markdown("### Paper Positions")
-    if portfolio.empty:
-        st.info("No paper positions yet.")
+        if positions.empty:
+            st.info("No current paper positions.")
+        else:
+            st.dataframe(positions, use_container_width=True, hide_index=True)
     else:
-        st.dataframe(portfolio, use_container_width=True, hide_index=True)
+        st.info("Paper positions will appear here after a valid Alpaca paper connection is available.")
 
-    st.markdown("### Simulated Orders")
-    if orders.empty:
-        st.info("No simulated orders yet.")
+    st.markdown("### Recent Paper Orders")
+    orders_result = get_paper_orders()
+    if orders_result["ok"]:
+        orders = _select_columns(
+            orders_result["data"],
+            ["submitted_at", "symbol", "side", "qty", "type", "time_in_force", "status"],
+        )
+        if orders.empty:
+            st.info("No recent paper orders.")
+        else:
+            st.dataframe(orders.head(25), use_container_width=True, hide_index=True)
     else:
-        st.dataframe(orders, use_container_width=True, hide_index=True)
+        st.info("Recent paper orders will appear here after a valid Alpaca paper connection is available.")
+
+    st.markdown("### Submit Paper Test Order")
+    with st.form("paper_order_form", clear_on_submit=True):
+        cols = st.columns([1, 1, 1])
+        symbol = cols[0].text_input("Symbol", value="AAPL")
+        qty = cols[1].number_input("Quantity", min_value=0.0, step=1.0, value=1.0)
+        side = cols[2].selectbox("Side", ["buy", "sell"])
+        notes = st.text_input("Notes", placeholder="Optional journal note")
+        confirmed = st.checkbox("I understand this is a simulated paper trade.")
+        submitted = st.form_submit_button("Submit Paper Test Order", type="primary")
+
+    if submitted:
+        if not confirmed:
+            st.error("Confirm the paper-trading checkbox before submitting.")
+            append_trade_journal(
+                symbol=symbol,
+                side=side,
+                qty=qty,
+                order_type="market",
+                status_result="rejected_missing_confirmation",
+                notes=notes,
+            )
+        else:
+            result = submit_paper_order(symbol=symbol, qty=qty, side=side)
+            status_result = "submitted" if result["ok"] else f"error: {result['error']}"
+            append_trade_journal(
+                symbol=symbol,
+                side=side,
+                qty=qty,
+                order_type="market",
+                status_result=status_result,
+                notes=notes,
+            )
+            if result["ok"]:
+                st.success(result["message"])
+                st.json(_select_order_fields(result["data"]))
+                _log(f"Submitted Alpaca paper {side} order for {symbol.upper()}")
+            else:
+                st.error(result["error"])
+                _log(f"Alpaca paper order failed for {symbol.upper()}")
+
+    st.markdown("### Trade Journal")
+    journal = read_trade_journal(limit=25)
+    if journal.empty:
+        st.info("No trade journal entries yet. Paper order attempts will be recorded here.")
+    else:
+        st.dataframe(journal, use_container_width=True, hide_index=True)
 
 
 def render_portfolio() -> None:
@@ -401,6 +448,25 @@ def _number(value: object) -> str:
 
 def _percent(value: object) -> str:
     return f"{value:.1%}" if isinstance(value, (int, float)) else "n/a"
+
+
+def _money_text(value: object) -> str:
+    try:
+        return f"${float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "n/a"
+
+
+def _select_columns(records: list[dict[str, object]], columns: list[str]) -> pd.DataFrame:
+    if not records:
+        return pd.DataFrame(columns=columns)
+    rows = [{column: record.get(column) for column in columns} for record in records]
+    return pd.DataFrame(rows)
+
+
+def _select_order_fields(order: dict[str, object]) -> dict[str, object]:
+    fields = ["id", "submitted_at", "symbol", "side", "qty", "type", "time_in_force", "status"]
+    return {field: order.get(field) for field in fields if field in order}
 
 
 def _window_return(history: pd.DataFrame, window: int) -> float | None:
