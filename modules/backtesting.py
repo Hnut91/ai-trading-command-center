@@ -27,6 +27,7 @@ def moving_average_crossover_backtest(
     results["long_ma"] = results["Close"].rolling(long_window).mean()
     results["signal"] = (results["short_ma"] > results["long_ma"]).astype(int)
     results["position"] = results["signal"].shift(1).fillna(0)
+    results["trade"] = results["position"].diff().abs().fillna(0)
     results["asset_return"] = results["Close"].pct_change().fillna(0)
     results["strategy_return"] = results["position"] * results["asset_return"]
     results["equity"] = starting_cash * (1 + results["strategy_return"]).cumprod()
@@ -41,6 +42,7 @@ def _metrics(results: pd.DataFrame, starting_cash: float) -> dict[str, float]:
     buy_hold_equity = float(results["buy_hold_equity"].iloc[-1])
     total_return = (ending_equity / starting_cash) - 1
     buy_hold_return = (buy_hold_equity / starting_cash) - 1
+    number_of_trades = int(results["trade"].sum())
     daily_returns = results["strategy_return"].dropna()
     volatility = float(daily_returns.std() * (252**0.5)) if len(daily_returns) > 1 else 0.0
     sharpe = float((daily_returns.mean() * 252) / volatility) if volatility else 0.0
@@ -50,6 +52,7 @@ def _metrics(results: pd.DataFrame, starting_cash: float) -> dict[str, float]:
         "ending_equity": round(ending_equity, 2),
         "total_return": round(total_return, 4),
         "buy_hold_return": round(buy_hold_return, 4),
+        "number_of_trades": number_of_trades,
         "volatility": round(volatility, 4),
         "sharpe": round(sharpe, 2),
         "max_drawdown": round(max_drawdown, 4),
@@ -67,6 +70,7 @@ def _empty_metrics(starting_cash: float) -> dict[str, float]:
         "ending_equity": starting_cash,
         "total_return": 0.0,
         "buy_hold_return": 0.0,
+        "number_of_trades": 0,
         "volatility": 0.0,
         "sharpe": 0.0,
         "max_drawdown": 0.0,

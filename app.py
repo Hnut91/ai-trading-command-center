@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, timedelta
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 from modules.backtesting import moving_average_crossover_backtest
 from modules.charts import backtest_equity_chart, price_volume_chart
@@ -146,6 +147,11 @@ def render_ticker_research() -> None:
         st.markdown("### AI Investment Memo")
         st.markdown(research["memo"])
 
+        st.markdown("### TradingView")
+        tradingview_url = _tradingview_url(research["ticker"])
+        components.html(_tradingview_embed(research["ticker"]), height=520, scrolling=False)
+        st.link_button("Open on TradingView", tradingview_url)
+
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Add To Watchlist"):
@@ -159,24 +165,36 @@ def render_daily_scanner() -> None:
     st.subheader("Daily Scanner")
     st.caption("Ranks the core mega-cap universe with simple_score using recent trend and volatility.")
 
-    if st.button("Run Scanner", type="primary"):
+    if st.button("Run Daily Scanner", type="primary"):
         rows = []
         with st.spinner("Scanning liquid mega-cap names..."):
             for ticker in SCANNER_UNIVERSE:
-                history = get_price_history(ticker, period="6mo")
-                snapshot = get_ticker_snapshot(ticker)
+                try:
+                    history = get_price_history(ticker, period="6mo")
+                    snapshot = get_ticker_snapshot(ticker)
+                    score = simple_score(history)
+                    one_month_return = _window_return(history, 21)
+                    three_month_return = _window_return(history, 63)
+                except Exception:
+                    snapshot = None
+                    score = 50.0
+                    one_month_return = None
+                    three_month_return = None
+
                 rows.append(
                     {
                         "ticker": ticker,
-                        "name": snapshot.name,
-                        "price": snapshot.price,
-                        "simple_score": simple_score(history),
-                        "one_month_return": _window_return(history, 21),
-                        "three_month_return": _window_return(history, 63),
+                        "name": snapshot.name if snapshot else "Unavailable",
+                        "price": snapshot.price if snapshot else None,
+                        "score": score,
+                        "classification": _scanner_classification(score),
+                        "explanation": _scanner_explanation(score, one_month_return, three_month_return),
+                        "one_month_return": one_month_return,
+                        "three_month_return": three_month_return,
                     }
                 )
 
-        scanner = pd.DataFrame(rows).sort_values("simple_score", ascending=False)
+        scanner = pd.DataFrame(rows).sort_values("score", ascending=False)
         st.session_state["scanner"] = scanner
         _log("Ran daily scanner")
 
@@ -193,14 +211,14 @@ def render_backtesting() -> None:
 
     cols = st.columns([1, 1, 1, 1])
     ticker = cols[0].text_input("Backtest ticker", value="MSFT").upper()
-    period = cols[1].selectbox("Backtest period", ["1y", "2y", "5y", "10y"], index=2)
+    start_date = cols[1].date_input("Start date", value=date.today() - timedelta(days=365 * 5))
     short_window = cols[2].number_input("Short MA", min_value=5, max_value=100, value=20, step=5)
     long_window = cols[3].number_input("Long MA", min_value=20, max_value=250, value=50, step=10)
     starting_cash = st.number_input("Starting cash", min_value=1_000.0, value=100_000.0, step=10_000.0)
 
     if st.button("Run Backtest", type="primary"):
         try:
-            history = get_price_history(ticker, period=period)
+            history = get_price_history(ticker, start=start_date)
             results, metrics = moving_average_crossover_backtest(
                 history,
                 short_window=int(short_window),
@@ -219,10 +237,10 @@ def render_backtesting() -> None:
 
     metrics = backtest["metrics"]
     metric_cols = st.columns(5)
-    metric_cols[0].metric("Ending Equity", _money(metrics["ending_equity"]))
-    metric_cols[1].metric("Strategy Return", _percent(metrics["total_return"]))
-    metric_cols[2].metric("Buy & Hold", _percent(metrics["buy_hold_return"]))
-    metric_cols[3].metric("Sharpe", _number(metrics["sharpe"]))
+    metric_cols[0].metric("Strategy Return", _percent(metrics["total_return"]))
+    metric_cols[1].metric("Buy & Hold", _percent(metrics["buy_hold_return"]))
+    metric_cols[2].metric("Trades", f"{metrics['number_of_trades']}")
+    metric_cols[3].metric("Ending Equity", _money(metrics["ending_equity"]))
     metric_cols[4].metric("Max Drawdown", _percent(metrics["max_drawdown"]))
 
     results = backtest["results"]
@@ -235,7 +253,7 @@ def render_backtesting() -> None:
 
 def render_paper_trading() -> None:
     st.subheader("Paper Trading")
-    st.caption("Simulated order ticket prepared for Alpaca paper trading. No real orders are placed.")
+    st.caption("Paper trading only. No live orders.")
 
     alpaca_configured = alpaca_ready(
         _secret_value("ALPACA_API_KEY"),
@@ -247,6 +265,17 @@ def render_paper_trading() -> None:
         if alpaca_configured
         else "Add ALPACA_API_KEY, ALPACA_SECRET_KEY, and ALPACA_BASE_URL to Streamlit secrets when ready."
     )
+
+    action_cols = st.columns(3)
+    if action_cols[0].button("Check Alpaca Connection"):
+        if alpaca_configured:
+            st.success("Alpaca paper credentials are configured. Live API calls are intentionally disabled.")
+        else:
+            st.warning("Missing Alpaca secrets. Add them in Streamlit Community Cloud secrets when ready.")
+    if action_cols[1].button("View Paper Account"):
+        st.info("Placeholder only. This will show paper account balances after Alpaca API calls are enabled.")
+    if action_cols[2].button("Submit Test Paper Order"):
+        st.info("Placeholder only. No order was sent to Alpaca.")
 
     with st.form("position_form", clear_on_submit=True):
         cols = st.columns(6)
@@ -388,6 +417,48 @@ def _secret_value(name: str) -> str | None:
         return st.secrets.get(name)
     except Exception:
         return None
+
+
+def _scanner_classification(score: float) -> str:
+    if score >= 70:
+        return "Long Watch"
+    if score <= 45:
+        return "Short Watch"
+    return "Avoid / Neutral"
+
+
+def _scanner_explanation(
+    score: float,
+    one_month_return: float | None,
+    three_month_return: float | None,
+) -> str:
+    if score >= 70:
+        return "Strong recent trend with acceptable volatility."
+    if score <= 45:
+        return "Weak or choppy trend; candidate for caution."
+    if one_month_return is None or three_month_return is None:
+        return "Insufficient clean price history; keep neutral."
+    if one_month_return > 0 and three_month_return > 0:
+        return "Positive trend, but score is not strong enough for long watch."
+    return "Mixed signal; wait for a clearer setup."
+
+
+def _tradingview_url(ticker: str) -> str:
+    return f"https://www.tradingview.com/symbols/NASDAQ-{ticker.upper()}/"
+
+
+def _tradingview_embed(ticker: str) -> str:
+    symbol = f"NASDAQ:{ticker.upper()}"
+    return f"""
+    <div class="tradingview-widget-container" style="height:500px;width:100%">
+      <iframe
+        src="https://www.tradingview.com/widgetembed/?symbol={symbol}&interval=D&theme=light&style=1&timezone=America%2FNew_York"
+        style="height:500px;width:100%;border:0"
+        allowtransparency="true"
+        scrolling="no">
+      </iframe>
+    </div>
+    """
 
 
 if __name__ == "__main__":

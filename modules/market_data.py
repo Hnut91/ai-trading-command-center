@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from typing import Iterable
 
 import pandas as pd
@@ -50,21 +51,31 @@ def normalize_ticker(ticker: str) -> str:
     return ticker.strip().upper()
 
 
-def get_price_history(ticker: str, period: str = "1y", interval: str = "1d") -> pd.DataFrame:
+def get_price_history(
+    ticker: str,
+    period: str = "1y",
+    interval: str = "1d",
+    start: date | str | None = None,
+) -> pd.DataFrame:
     """Download historical OHLCV data from yfinance."""
 
     symbol = normalize_ticker(ticker)
     if not symbol:
         return pd.DataFrame()
 
-    history = yf.download(
-        symbol,
-        period=period,
-        interval=interval,
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-    )
+    download_kwargs = {
+        "tickers": symbol,
+        "interval": interval,
+        "auto_adjust": True,
+        "progress": False,
+        "threads": False,
+    }
+    if start:
+        download_kwargs["start"] = start
+    else:
+        download_kwargs["period"] = period
+
+    history = yf.download(**download_kwargs)
     if history.empty:
         return history
 

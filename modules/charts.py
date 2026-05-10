@@ -71,6 +71,17 @@ def backtest_equity_chart(results: pd.DataFrame, ticker: str) -> go.Figure:
 
     fig.add_trace(go.Scatter(x=results["Date"], y=results["equity"], name="Strategy Equity"))
     fig.add_trace(go.Scatter(x=results["Date"], y=results["buy_hold_equity"], name="Buy & Hold"))
+    if {"short_ma", "long_ma"}.issubset(results.columns):
+        buys = results[results["trade"] > 0]
+        fig.add_trace(
+            go.Scatter(
+                x=buys["Date"],
+                y=buys["equity"],
+                mode="markers",
+                name="Trade",
+                marker=dict(size=8),
+            )
+        )
     fig.update_layout(
         title=f"{ticker.upper()} Moving-Average Crossover Backtest",
         height=420,
