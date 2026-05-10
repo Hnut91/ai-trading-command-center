@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from html import escape
 
 import pandas as pd
 import streamlit as st
@@ -19,6 +20,13 @@ from modules.alpaca_client import (
 from modules.charts import backtest_equity_chart, price_volume_chart
 from modules.market_data import DEFAULT_IDEAS, get_daily_ideas, get_price_history, get_ticker_snapshot
 from modules.memo_agent import generate_investment_memo
+from modules.news import (
+    catalyst_score,
+    combined_scanner_score,
+    generate_catalyst_summary,
+    get_yfinance_news,
+    top_headline,
+)
 from modules.scoring import score_ideas, score_ticker, simple_score
 from modules.trade_journal import append_trade_journal, read_trade_journal
 
@@ -247,6 +255,32 @@ def inject_command_center_css() -> None:
             background: var(--cc-card);
         }
 
+        .cc-news-card {
+            border: 1px solid var(--cc-border);
+            border-radius: 8px;
+            background: linear-gradient(180deg, rgba(16, 31, 25, 0.96), rgba(8, 17, 14, 0.96));
+            padding: 12px 14px;
+            margin-bottom: 10px;
+        }
+
+        .cc-news-card a {
+            color: var(--cc-green) !important;
+            font-weight: 800;
+            text-decoration: none;
+        }
+
+        .cc-news-meta {
+            color: var(--cc-muted);
+            font-size: 0.78rem;
+            margin-top: 6px;
+        }
+
+        .cc-news-summary {
+            color: var(--cc-text);
+            font-size: 0.88rem;
+            margin-top: 8px;
+        }
+
         .stAlert {
             border-radius: 8px;
         }
@@ -288,6 +322,31 @@ def render_metric_card(column: object, label: str, value: object) -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_news_cards(news_items: list[dict[str, object]]) -> None:
+    if not news_items:
+        st.info("No recent yfinance news was available for this ticker.")
+        return
+
+    for item in news_items[:10]:
+        title = escape(str(item.get("title") or "Untitled headline"))
+        publisher = escape(str(item.get("publisher") or "Unknown"))
+        published_at = escape(str(item.get("published_at") or "Date unavailable"))
+        link = escape(str(item.get("link") or ""))
+        summary = escape(str(item.get("summary") or ""))
+        title_html = f'<a href="{link}" target="_blank" rel="noopener noreferrer">{title}</a>' if link else title
+        summary_html = f'<div class="cc-news-summary">{summary}</div>' if summary else ""
+        st.markdown(
+            f"""
+            <div class="cc-news-card">
+                <div>{title_html}</div>
+                <div class="cc-news-meta">{publisher} / {published_at}</div>
+                {summary_html}
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
 
 def render_daily_ideas() -> None:
@@ -344,11 +403,20 @@ def render_ticker_research() -> None:
             snapshot = get_ticker_snapshot(ticker)
             history = get_price_history(ticker, period=period)
             score = score_ticker(snapshot.as_dict(), history)
+            news_items = get_yfinance_news(ticker, limit=10)
+            news_score = catalyst_score(news_items)
             memo = generate_investment_memo(
                 ticker,
                 snapshot.as_dict(),
                 score,
                 notes,
+                api_key=_secret_value("OPENAI_API_KEY"),
+            )
+            catalyst_summary = generate_catalyst_summary(
+                ticker=ticker,
+                news_items=news_items,
+                market_data=snapshot.as_dict(),
+                score=score,
                 api_key=_secret_value("OPENAI_API_KEY"),
             )
 
@@ -357,6 +425,9 @@ def render_ticker_research() -> None:
                 "snapshot": snapshot.as_dict(),
                 "history": history,
                 "score": score,
+                "news": news_items,
+                "catalyst_score": news_score,
+                "catalyst_summary": catalyst_summary,
                 "memo": memo,
             }
             _log(f"Generated research memo for {ticker}")
@@ -366,6 +437,8 @@ def render_ticker_research() -> None:
         snapshot = research["snapshot"]
         score = research["score"]
         history = research["history"]
+        news_items = research.get("news", [])
+        news_score = research.get("catalyst_score", 0)
 
         with main_col:
             metric_cols = st.columns(6)
@@ -378,6 +451,18 @@ def render_ticker_research() -> None:
 
             if isinstance(history, pd.DataFrame) and not history.empty:
                 st.plotly_chart(price_volume_chart(history, research["ticker"]), use_container_width=True)
+
+            with st.container(border=True):
+                st.markdown("### Recent News & Catalysts")
+                catalyst_cols = st.columns(3)
+                render_metric_card(catalyst_cols[0], "Catalyst Score", f"{news_score}/100")
+                render_metric_card(catalyst_cols[1], "Headlines", len(news_items))
+                render_metric_card(catalyst_cols[2], "Top Catalyst", _catalyst_label(news_score))
+                render_news_cards(news_items)
+
+            with st.container(border=True):
+                st.markdown("### AI Catalyst Summary")
+                st.markdown(research.get("catalyst_summary") or "Run research to generate a catalyst summary.")
 
         st.markdown("### TradingView Widget")
         tradingview_url = _tradingview_url(research["ticker"])
@@ -419,12 +504,31 @@ def render_daily_scanner() -> None:
     scanner = st.session_state.get("scanner")
     with result_col:
         if isinstance(scanner, pd.DataFrame) and not scanner.empty:
+            if "combined_score" not in scanner:
+                st.info("Run the scanner again to add catalyst scores to the result table.")
+                return
             metric_cols = st.columns(4)
             render_metric_card(metric_cols[0], "Tickers Scanned", len(scanner))
-            render_metric_card(metric_cols[1], "Highest Score", _number(scanner["score"].max()))
+            render_metric_card(metric_cols[1], "Highest Combined", _number(scanner["combined_score"].max()))
             render_metric_card(metric_cols[2], "Long Watch", int((scanner["classification"] == "Long Watch").sum()))
             render_metric_card(metric_cols[3], "Short Watch", int((scanner["classification"] == "Short Watch").sum()))
-            st.dataframe(scanner, use_container_width=True, hide_index=True)
+            st.dataframe(
+                scanner[
+                    [
+                        "ticker",
+                        "name",
+                        "price",
+                        "simple_score",
+                        "catalyst_score",
+                        "combined_score",
+                        "classification",
+                        "top_headline",
+                        "explanation",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
+            )
         else:
             st.info("Run the scanner to rank AAPL, MSFT, NVDA, META, AMZN, GOOGL, and TSLA.")
 
@@ -777,31 +881,50 @@ def _run_daily_scanner() -> None:
             try:
                 history = get_price_history(ticker, period="6mo")
                 snapshot = get_ticker_snapshot(ticker)
-                score = simple_score(history)
+                simple = simple_score(history)
                 one_month_return = _window_return(history, 21)
                 three_month_return = _window_return(history, 63)
+                news_items = get_yfinance_news(ticker, limit=5)
+                catalyst = catalyst_score(news_items)
+                combined = combined_scanner_score(simple, catalyst)
             except Exception:
                 snapshot = None
-                score = 50.0
+                simple = 50.0
                 one_month_return = None
                 three_month_return = None
+                news_items = []
+                catalyst = 20
+                combined = combined_scanner_score(simple, catalyst)
 
             rows.append(
                 {
                     "ticker": ticker,
                     "name": snapshot.name if snapshot else "Unavailable",
                     "price": snapshot.price if snapshot else None,
-                    "score": score,
-                    "classification": _scanner_classification(score),
-                    "explanation": _scanner_explanation(score, one_month_return, three_month_return),
+                    "simple_score": simple,
+                    "catalyst_score": catalyst,
+                    "combined_score": combined,
+                    "classification": _scanner_classification(combined),
+                    "top_headline": top_headline(news_items),
+                    "explanation": _scanner_explanation(combined, one_month_return, three_month_return),
                     "one_month_return": one_month_return,
                     "three_month_return": three_month_return,
                 }
             )
 
-    scanner = pd.DataFrame(rows).sort_values("score", ascending=False)
+    scanner = pd.DataFrame(rows).sort_values("combined_score", ascending=False)
     st.session_state["scanner"] = scanner
     _log("Ran daily scanner")
+
+
+def _catalyst_label(score: object) -> str:
+    if not isinstance(score, (int, float)):
+        return "Unknown"
+    if score >= 70:
+        return "High"
+    if score >= 45:
+        return "Moderate"
+    return "Low"
 
 
 def _tradingview_url(ticker: str) -> str:
